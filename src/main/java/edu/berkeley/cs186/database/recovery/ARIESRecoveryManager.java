@@ -7,6 +7,7 @@ import edu.berkeley.cs186.database.io.DiskSpaceManager;
 import edu.berkeley.cs186.database.memory.BufferManager;
 import edu.berkeley.cs186.database.memory.Page;
 import edu.berkeley.cs186.database.recovery.records.*;
+//import sun.rmi.transport.Endpoint;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -93,7 +94,14 @@ public class ARIESRecoveryManager implements RecoveryManager {
     @Override
     public long commit(long transNum) {
         // TODO(proj5): implement
-        return -1L;
+        TransactionTableEntry xactEntry = transactionTable.get(transNum);
+
+        long newLSN = logManager.appendToLog(new CommitTransactionLogRecord(transNum, xactEntry.lastLSN)); // append a commit record to the log manager
+        logManager.flushToLSN(newLSN); // flush the log
+
+        xactEntry.transaction.setStatus(Transaction.Status.COMMITTING); // change xact status to Committing in Xact Table
+        xactEntry.lastLSN = newLSN; // update xact lasLSN in Xact Table
+        return newLSN;
     }
 
     /**
@@ -109,7 +117,13 @@ public class ARIESRecoveryManager implements RecoveryManager {
     @Override
     public long abort(long transNum) {
         // TODO(proj5): implement
-        return -1L;
+        TransactionTableEntry xactEntry = transactionTable.get(transNum);
+
+        long newLSN = logManager.appendToLog(new AbortTransactionLogRecord(transNum, xactEntry.lastLSN)); // append an abort record to the log manager
+
+        xactEntry.transaction.setStatus(Transaction.Status.ABORTING); // change xact status to Aborting in Xact Table
+        xactEntry.lastLSN = newLSN; // update xact lasLSN in Xact Table
+        return newLSN;
     }
 
     /**
@@ -127,7 +141,15 @@ public class ARIESRecoveryManager implements RecoveryManager {
     @Override
     public long end(long transNum) {
         // TODO(proj5): implement
-        return -1L;
+        TransactionTableEntry xactEntry = transactionTable.get(transNum);
+
+        if (xactEntry.transaction.getStatus() == Transaction.Status.ABORTING) {
+            rollbackToLSN(transNum, 0); // roll back changes if the transaction is aborting
+        }
+
+        transactionTable.remove(transNum); // transaction is removed from Xact Table
+        xactEntry.transaction.setStatus(Transaction.Status.COMPLETE);
+        return logManager.appendToLog(new EndTransactionLogRecord(transNum, xactEntry.lastLSN)); // append an end record to the Xact Table
     }
 
     /**
@@ -155,6 +177,16 @@ public class ARIESRecoveryManager implements RecoveryManager {
         // back from the next record that hasn't yet been undone.
         long currentLSN = lastRecord.getUndoNextLSN().orElse(lastRecordLSN);
         // TODO(proj5) implement the rollback logic described above
+        while (currentLSN > LSN) {
+            LogRecord currentRecord = logManager.fetchLogRecord(currentLSN); // fetch current log record (of aborting xact)
+            if (currentRecord.isUndoable()) { // can we undo this record's operation?
+                LogRecord clr = currentRecord.undo(transactionEntry.lastLSN); // create a compensation log record
+                long clrLSN = logManager.appendToLog(clr); // append the clr to the log
+                transactionEntry.lastLSN = clrLSN; // update the lastLSN of the xact in the xact table
+                clr.redo(this, this.diskSpaceManager, this.bufferManager); // call redo on the clr to perform the undo
+            }
+            currentLSN = currentRecord.getPrevLSN().orElse(LSN);
+        }
     }
 
     /**
@@ -205,7 +237,19 @@ public class ARIESRecoveryManager implements RecoveryManager {
         assert (before.length == after.length);
         assert (before.length <= BufferManager.EFFECTIVE_PAGE_SIZE / 2);
         // TODO(proj5): implement
-        return -1L;
+        TransactionTableEntry transactionEntry = transactionTable.get(transNum);
+        assert (transactionEntry != null);
+
+        long prevLSN = transactionEntry.lastLSN;
+        LogRecord record = new UpdatePageLogRecord(transNum, pageNum, prevLSN, pageOffset, before, after);
+        long LSN = logManager.appendToLog(record);
+        // Update the xact's lastLSN in xact table
+        transactionEntry.lastLSN = LSN;
+        // update dpt if page is new
+        if (!dirtyPageTable.containsKey(pageNum)) {
+            dirtyPageTable.put(pageNum, LSN);
+        }
+        return LSN;
     }
 
     /**
@@ -381,7 +425,7 @@ public class ARIESRecoveryManager implements RecoveryManager {
         long savepointLSN = transactionEntry.getSavepoint(name);
 
         // TODO(proj5): implement
-        return;
+        rollbackToLSN(transNum, savepointLSN);
     }
 
     /**
@@ -408,6 +452,38 @@ public class ARIESRecoveryManager implements RecoveryManager {
         Map<Long, Pair<Transaction.Status, Long>> chkptTxnTable = new HashMap<>();
 
         // TODO(proj5): generate end checkpoint record(s) for DPT and transaction table
+        int numDPTRecords = 0; int numTxnTableRecords = 0;
+        for (long pageNum : dirtyPageTable.keySet()) {
+            long recLSN = dirtyPageTable.get(pageNum);
+            if (EndCheckpointLogRecord.fitsInOneRecord(numDPTRecords + 1, numTxnTableRecords)) {
+                chkptDPT.put(pageNum, recLSN);
+                numDPTRecords += 1;
+            } else {
+                LogRecord r = new EndCheckpointLogRecord(chkptDPT, chkptTxnTable);
+                logManager.appendToLog(r);
+                chkptDPT.clear();
+                chkptTxnTable.clear();
+                chkptDPT.put(pageNum, recLSN);
+                numDPTRecords = 1;
+                numTxnTableRecords = 0;
+            }
+        }
+        for (long xactID : transactionTable.keySet()) {
+            Transaction.Status status = transactionTable.get(xactID).transaction.getStatus();
+            long lastLSN = transactionTable.get(xactID).lastLSN;
+            if (EndCheckpointLogRecord.fitsInOneRecord(numDPTRecords, numTxnTableRecords + 1)) {
+                chkptTxnTable.put(xactID, new Pair<>(status, lastLSN));
+                numTxnTableRecords += 1;
+            } else {
+                LogRecord r = new EndCheckpointLogRecord(chkptDPT, chkptTxnTable);
+                logManager.appendToLog(r);
+                chkptDPT.clear();
+                chkptTxnTable.clear();
+                chkptTxnTable.put(xactID, new Pair<>(status, lastLSN));
+                numDPTRecords = 0;
+                numTxnTableRecords = 1;
+            }
+        }
 
         // Last end checkpoint record
         LogRecord endRecord = new EndCheckpointLogRecord(chkptDPT, chkptTxnTable);
@@ -520,7 +596,101 @@ public class ARIESRecoveryManager implements RecoveryManager {
         // Set of transactions that have completed
         Set<Long> endedTransactions = new HashSet<>();
         // TODO(proj5): implement
-        return;
+        Iterator<LogRecord> log = logManager.scanFrom(LSN);
+        while (log.hasNext()) {
+            LogRecord r = log.next();
+            if (r.getTransNum().isPresent()) { // check whether the record produces a non-empty result for LogRecord#getTransNum()
+                if (!transactionTable.containsKey(r.getTransNum().get())) { // check if xact isn't in Xact Table
+                    Transaction t = newTransaction.apply(r.getTransNum().get()); // create new xact
+                    startTransaction(t); // add xact to XactTtable
+                }
+                transactionTable.get(r.getTransNum().get()).lastLSN = r.getLSN(); // update xact's lastLSN
+            }
+            if ((r instanceof UpdatePageLogRecord) || (r instanceof UndoUpdatePageLogRecord)) { // check if record dirtied page w/out flushing to disk
+                if (r.getPageNum().isPresent()) { // should be true bc we are dealing with UpdatePage and UndoUpdatePag records
+                    long pageNum = r.getPageNum().get(); // retrieve pageNum from log record
+                    if (!dirtyPageTable.containsKey(pageNum)) { // check that dpt does not contain pageNum of page dirtied by record
+                        dirtyPageTable.put(pageNum, r.getLSN()); // add pageNum and recLSn to dpt
+                    }
+                }
+            }
+            if ((r instanceof FreePageLogRecord) || (r instanceof UndoAllocPageLogRecord)) { // check that record already flushed changes to disk
+                long pageNum = r.getPageNum().get(); // retrieve pageNum from log record
+                dirtyPageTable.remove(pageNum); // remove dirty page (and LSN) from dpt if it exists
+            }
+            if (r instanceof CommitTransactionLogRecord) { // check that log record r is commit type
+                TransactionTableEntry xactEntry = transactionTable.get(r.getTransNum().get()); // retrieve xact entry corresponding to r from Xact Table
+                xactEntry.transaction.setStatus(Transaction.Status.COMMITTING); // change xact status to Committing
+                xactEntry.lastLSN = r.getLSN(); // update xact lastLSN in Xact Table
+            }
+            if (r instanceof AbortTransactionLogRecord) { // check that log record r is abort type
+                TransactionTableEntry xactEntry = transactionTable.get(r.getTransNum().get()); // retrieve xact entry corresponding to r from Xact Table
+                xactEntry.transaction.setStatus(Transaction.Status.RECOVERY_ABORTING); // change xact status to Recovery Aborting
+                xactEntry.lastLSN = r.getLSN(); // update xact lastLSN in Xact Table
+            }
+            if (r instanceof EndTransactionLogRecord) { // check that log record r is end type
+                TransactionTableEntry xactEntry = transactionTable.get(r.getTransNum().get()); // retrieve xact entry corresponding to r from Xact Table
+                xactEntry.transaction.cleanup(); // clean up xact before setting status
+                xactEntry.transaction.setStatus(Transaction.Status.COMPLETE); // set xact status to Complete
+                transactionTable.remove(r.getTransNum().get()); // remove xact from Xact Table
+                endedTransactions.add(r.getTransNum().get()); // added xact id to endedTransactions set, officially ending it
+            }
+            if (r instanceof EndCheckpointLogRecord) { // check that log record r is endchkpt type
+                Map <Long, Long> chkptDPT = r.getDirtyPageTable(); // retrieve the chkpt's dirty page table
+                for (long pageNum : chkptDPT.keySet()) // skim through each pageNum in the chkptDPT
+                 {
+                    long chkptRecLSN = chkptDPT.get(pageNum); // retrieve chkptRecLSN that corresponds to pageNum
+                    if (!dirtyPageTable.containsKey(pageNum)) { // check that in-memory dpt does not contain pageNum
+                        dirtyPageTable.put(pageNum, chkptRecLSN); // add pageNum and chkptRecLSN
+                    } else { // observe that in-mem dpt already contains pageNum
+                        dirtyPageTable.replace(pageNum, chkptRecLSN); // replace in-mem recLSN that corresponds with pageNum with more-accurate chkptRecLSN
+                    }
+                }
+                Map <Long, Pair<Transaction.Status, Long>> chkptXactTable = r.getTransactionTable(); // retrieve the checkpoint's Xact Table
+                for (long xactID : chkptXactTable.keySet()) // skim through each xactID in the chkptXactTable
+                {
+                    if (!endedTransactions.contains(xactID)) { // check that xactID didn't already end (as in be part of endedTransactions)
+                        if (!transactionTable.containsKey(xactID)) { // check that in-mem Xact Table doesn't contain xactID
+                            Transaction t = newTransaction.apply(xactID); // create new xact corresponding to xactID
+                            startTransaction(t); // add xact t to in-memory Xact Table
+                        }
+                        if (transactionTable.get(xactID).lastLSN < chkptXactTable.get(xactID).getSecond()) // check that in-mem lastLSN < chkpt lastLSN
+                        {
+                            transactionTable.get(xactID).lastLSN = chkptXactTable.get(xactID).getSecond(); // update in-mem lastLSN to chkpt lastLSN
+                        }
+                        Transaction t = transactionTable.get(xactID).transaction; // retrieve xact corresponding to xactID in Xact Table
+                        Transaction.Status inMemStatus = t.getStatus(); // retrieve in-mem status for xact
+                        Transaction.Status chkptStatus = chkptXactTable.get(xactID).getFirst(); // retrieve chkpt status for xact
+                        if ((inMemStatus == Transaction.Status.RUNNING) && (chkptStatus != Transaction.Status.RUNNING)) // check that in-mem xact is running and chkpt xact is not (i.e. greater)
+                        {
+                            if (chkptStatus == Transaction.Status.ABORTING) // check that chkptStatus is ABORTING
+                            {
+                                t.setStatus(Transaction.Status.RECOVERY_ABORTING); // call in-mem status RECOVERY_ABORTING
+                            } else {
+                                t.setStatus(chkptStatus); // call in-mem status COMMITTING or COMPLETE
+                            }
+                        } else if ((inMemStatus != Transaction.Status.COMPLETE) && (chkptStatus == Transaction.Status.COMPLETE)) { // implies inMemStatus is ABORTING OR COMMITTING, check that chkpSTATUS is COMPLETE (highest)
+                            t.setStatus(chkptStatus); // set in-mem status to COMPLETE
+                        }
+                    }
+                }
+            }
+        }
+        for (long xactID : transactionTable.keySet()) { // skim through transactionTable's xactIDs
+            TransactionTableEntry xactEntry = transactionTable.get(xactID); // retrieve xactEntry corresponding to xactID
+            Transaction.Status status = xactEntry.transaction.getStatus(); // retrieve status corresponding to xactEntry
+            if (status == Transaction.Status.COMMITTING) { // check that status is COMMITTING
+                xactEntry.transaction.cleanup(); // call Transaction#cleanup() on xact before changing status
+                xactEntry.transaction.setStatus(Transaction.Status.COMPLETE); // change xact status to COMPLETE
+                transactionTable.remove(xactID); // remove xactID-xactEntry mapping from Xact Table
+                logManager.appendToLog(new EndTransactionLogRecord(xactID, xactEntry.lastLSN)); // append EndTransactionLogRecord to logManager
+            }
+            if (status == Transaction.Status.RUNNING) { // check that status is RUNNING
+                xactEntry.transaction.setStatus(Transaction.Status.RECOVERY_ABORTING); // change xact status to RECOVERY_ABORTING
+                long lastLSN = logManager.appendToLog(new AbortTransactionLogRecord(xactID, xactEntry.lastLSN)); // append AbortTransactionLogRecord to logManager
+                xactEntry.lastLSN = lastLSN; // update lastLSN in Xact Table
+            }
+        }
     }
 
     /**
@@ -537,7 +707,45 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     void restartRedo() {
         // TODO(proj5): implement
-        return;
+        if (dirtyPageTable.isEmpty()) {
+            return;
+        }
+        long minRecLSN = Long.MAX_VALUE; // set initial minRecLSN to highest possible value
+        for (long pageNum : dirtyPageTable.keySet()) // iterate pageNum over dpt keys
+        {
+            long recLSN = dirtyPageTable.get(pageNum); // retrieve the recLSN corresponding to pageNum
+            if (recLSN < minRecLSN) { // check that recLSN is less than minRecLSN
+                minRecLSN = recLSN; // set minRecLSN to recLSN
+            }
+        }
+        Iterator<LogRecord> log = logManager.scanFrom(minRecLSN); // create iterator to scan logRecords from minRecLSN
+        while (log.hasNext()) {
+            LogRecord r = log.next();
+            if (r.isRedoable()) { // check that log record r is redo-able
+                if (r instanceof AllocPartLogRecord || r instanceof UndoAllocPartLogRecord || r instanceof FreePartLogRecord || r instanceof UndoFreePartLogRecord) { // check that r is a partition-related record
+                    r.redo(this, this.diskSpaceManager, this.bufferManager); // redo the record
+                }
+                else if (r instanceof AllocPageLogRecord || r instanceof UndoFreePageLogRecord) { // check that r is a record that allocates a page (AllocPage, UndoFreePage)
+                    r.redo(this, this.diskSpaceManager, this.bufferManager);
+                }
+                else if (r instanceof UpdatePageLogRecord || r instanceof UndoUpdatePageLogRecord || r instanceof FreePageLogRecord || r instanceof UndoAllocPageLogRecord) { // check that r is a record that modifies a page
+                    if (r.getPageNum().isPresent()) { // check that the record has a pageNum
+                        if (dirtyPageTable.containsKey(r.getPageNum().get())) { // check that the pageNum is in the dpt
+                            if (r.getLSN() >= dirtyPageTable.get(r.getPageNum().get())) { // check that r's LSN is greater than or equal to the recLSN of the page
+                                Page page = bufferManager.fetchPage(new DummyLockContext(), r.getPageNum().get()); // retrieve the page from the buffer manager
+                                try {
+                                    if (page.getPageLSN() < r.getLSN()) { // check that the page's lsn is strictly less than that of r
+                                        r.redo(this, this.diskSpaceManager, this.bufferManager); // redo the record
+                                    }
+                                } finally {
+                                    page.unpin(); // release the page from the memory buffers
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -555,7 +763,41 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     void restartUndo() {
         // TODO(proj5): implement
-        return;
+        PriorityQueue<Long> abortLastLSN = new PriorityQueue<>(Collections.reverseOrder()); // initialize an empty PriorityQueue<Long> to queue largest LSNs
+        for (Long xactID : transactionTable.keySet()) // iterate xact Ids over the Xact Table
+        {
+            TransactionTableEntry xactEntry = transactionTable.get(xactID); // retrieve the xact entry from Xact Table
+            if (xactEntry.transaction.getStatus() == Transaction.Status.RECOVERY_ABORTING) { // check that the xact status is RECOVERY_ABORTING
+                abortLastLSN.add(xactEntry.lastLSN); // add the xact entry LSN to the priority queue
+            }
+        }
+        while (!abortLastLSN.isEmpty()) // continue until the priority queue is empty
+        {
+            long lastLSN = abortLastLSN.remove(); // remove the (highest) last LSN of an aborting xact from the queue
+            LogRecord lastRecord = logManager.fetchLogRecord(lastLSN); // retrieve the log record of this xact's last LSN from log managers
+            if (lastRecord.isUndoable()) { // check that lastRecord is undoable
+                if (lastRecord.getTransNum().isPresent()) { // check that lastRecord does have a corresponding xactID
+                    long xactID = lastRecord.getTransNum().get(); // retrieve xactID from lastRecord
+                    TransactionTableEntry xactEntry = transactionTable.get(xactID); // retrieve xactEntry from Xact Table using xactID
+                    LogRecord clr = lastRecord.undo(xactEntry.lastLSN); // create a CLR undoing lastRecord (implicitly, lastLSN of this xact is latsLSN)
+                    xactEntry.lastLSN = logManager.appendToLog(clr); // append CLR to log manager and set lastLSN of xact to clrLSN using xactID
+                    clr.redo(this, this.diskSpaceManager, this.bufferManager); // call redo on CLR
+                }
+            }
+            long nextLSN = lastRecord.getUndoNextLSN().orElse(lastRecord.getPrevLSN().orElse((long) 0)); // retrieve nextLSN of Xact, either next undo-able or previous LSN or 0
+            if (nextLSN != 0) { // check that we got the next undo-able LSN or the previous LSN
+                abortLastLSN.add(nextLSN); // add to the priority queue
+            } else { // implies that we got LSN 0
+                if (lastRecord.getTransNum().isPresent()) { // check that lastRecord does have a corresponding xactID
+                    long xactID = lastRecord.getTransNum().get(); // retrieve xactID from lastRecord
+                    TransactionTableEntry xactEntry = transactionTable.get(xactID);
+                    xactEntry.transaction.cleanup(); // clean up xact
+                    xactEntry.transaction.setStatus(Transaction.Status.COMPLETE); // set xact status to COMPLETE
+                    transactionTable.remove(xactID); // remove xact from Xact Table
+                    logManager.appendToLog(new EndTransactionLogRecord(xactID, xactEntry.lastLSN)); // append an end record to the Xact Table
+                }
+            }
+        }
     }
 
     /**
