@@ -764,6 +764,9 @@ public class ARIESRecoveryManager implements RecoveryManager {
     void restartUndo() {
         // TODO(proj5): implement
         PriorityQueue<Long> abortLastLSN = new PriorityQueue<>(Collections.reverseOrder()); // initialize an empty PriorityQueue<Long> to queue largest LSNs
+        if (transactionTable.isEmpty()) {
+            return;
+        }
         for (Long xactID : transactionTable.keySet()) // iterate xact Ids over the Xact Table
         {
             TransactionTableEntry xactEntry = transactionTable.get(xactID); // retrieve the xact entry from Xact Table
